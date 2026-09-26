@@ -6,9 +6,15 @@
 - ``POST /calibrate``：客户端提交以原录音毫秒计时的字幕片段，以及至少两组
   "原时间 -> 成片时间" 同步锚点；服务端在相邻锚点间做线性换算，
   并对超出锚点覆盖范围、换算后时长非正的片段返回错误。
+- ``POST /layout/wrap``：接收字幕片段与行宽、行数约束，按 Unicode 码点显示
+  宽度（东亚全角/宽字符 2 格，其余 1 格）为每段做全局最优断行，保留原时码
+  与文字，返回各行文字与断行字符偏移；无法排版或片段时长非正时返回 422
+  并指出字幕下标。
 """
 from __future__ import annotations
 
+import json
+import unicodedata
 from array import array
 from bisect import bisect_right
 from fractions import Fraction
@@ -97,6 +103,42 @@ class ErrorItem(BaseModel):
     index: Optional[int] = Field(None, description="出错元素下标（从 0 开始）")
     code: str = Field(..., description="错误代码")
     message: str = Field(..., description="错误说明")
+
+
+class WrapSegment(BaseModel):
+    """一条待断行排版的字幕片段。"""
+
+    start: int = Field(..., description="片段起始时间（毫秒）")
+    end: int = Field(..., description="片段结束时间（毫秒）")
+    text: str = Field(..., description="字幕文字")
+
+
+class WrapRequest(BaseModel):
+    segments: List[WrapSegment] = Field(..., description="待断行排版的字幕片段")
+    max_width: int = Field(..., gt=0, description="每行最大显示宽度（格），正整数")
+    max_lines: int = Field(..., ge=1, le=4, description="每段最多行数，1~4")
+
+    @field_validator("segments")
+    @classmethod
+    def _segments_not_empty(cls, v: List[WrapSegment]) -> List[WrapSegment]:
+        if not v:
+            raise ValueError("segments 不能为空")
+        return v
+
+
+class WrappedSegment(BaseModel):
+    index: int = Field(..., description="片段在输入中的位置（从 0 开始）")
+    start: int = Field(..., description="原片段起始时间（毫秒）")
+    end: int = Field(..., description="原片段结束时间（毫秒）")
+    text: str = Field(..., description="原字幕文字")
+    lines: List[str] = Field(..., description="断行后的各行文字")
+    breaks: List[int] = Field(
+        ..., description="断行字符偏移：在原文第 i 个码点（从 0 计）之前断行，升序"
+    )
+
+
+class WrapResponse(BaseModel):
+    segments: List[WrappedSegment]
 
 
 # --------------------------------------------------------------------------- #
@@ -443,6 +485,201 @@ def suggest_anchors(
 
 
 # --------------------------------------------------------------------------- #
+# 字幕断行排版逻辑
+# --------------------------------------------------------------------------- #
+# 避头尾规则：行首不得出现以下标点，行尾不得为开括号
+LINE_START_FORBIDDEN = frozenset("，。！？；：）】")
+LINE_END_FORBIDDEN = frozenset("（【")
+
+
+def display_width(ch: str) -> int:
+    """单个 Unicode 码点的显示宽度：东亚全角/宽字符 2 格，其余 1 格。"""
+    return 2 if unicodedata.east_asian_width(ch) in ("F", "W") else 1
+
+
+def wrap_text(
+    text: str, max_width: int, max_lines: int
+) -> Optional[Tuple[List[str], List[int]]]:
+    """对单段文字求全局最优断行，返回 (各行文字, 断点字符偏移)；不可行返回 None。
+
+    在所有满足约束（只在字符之间断行、行非空且不超 max_width、避头尾、
+    行数不超过 max_lines）的方案中依次优化：
+      1. 行数最少；
+      2. 最大行宽最小；
+      3. 各行宽平方和最小；
+      4. 断点序列字典序最小。
+
+    分四个阶段求解（动态规划或带交换论证的构造，而非逐行贪心）。
+    """
+    n = len(text)
+    if n == 0:
+        return None
+
+    # 码点显示宽度的前缀和，prefix[e] - prefix[p] 即 text[p:e] 的行宽
+    prefix = [0] * (n + 1)
+    for i, ch in enumerate(text):
+        prefix[i + 1] = prefix[i] + display_width(ch)
+
+    # can_start[p]：允许一行从 p 开始；can_end[e]：允许一行在 e 结束
+    can_start = [ch not in LINE_START_FORBIDDEN for ch in text]
+    can_end = [False] * (n + 1)
+    for e in range(1, n + 1):
+        can_end[e] = text[e - 1] not in LINE_END_FORBIDDEN
+
+    # 阶段 1：最少行数 k。每行尽量向右延展的贪心可证最优（交换论证：
+    # 对任意可行解，贪心第 i 行的结束位置不早于它，故贪心行数 ≤ 任意可行解）。
+    # 注意行尾 e 还须满足 e == n 或下一行能在 e 起始，否则贪心会越过可行断点。
+    cuts = [0]
+    while cuts[-1] < n:
+        cur = cuts[-1]
+        if not can_start[cur]:
+            return None
+        nxt = -1
+        e = cur + 1
+        while e <= n and prefix[e] - prefix[cur] <= max_width:
+            if can_end[e] and (e == n or can_start[e]):
+                nxt = e
+            e += 1
+        if nxt == -1:
+            return None
+        cuts.append(nxt)
+    k = len(cuts) - 1
+    if k > max_lines:
+        return None
+
+    # 阶段 2：恰好 k 行时最大行宽的最小值 M（min-max 动态规划，
+    # f[j][i] 表示 text[:i] 排成 j 行时的最小最大行宽）
+    INF = float("inf")
+    f = [[INF] * (n + 1) for _ in range(k + 1)]
+    f[0][0] = 0
+    for j in range(1, k + 1):
+        prev, cur_row = f[j - 1], f[j]
+        for i in range(1, n + 1):
+            if not can_end[i]:
+                continue
+            best = INF
+            p = i - 1
+            while p >= 0 and prefix[i] - prefix[p] <= max_width:
+                if can_start[p] and prev[p] != INF:
+                    w = prefix[i] - prefix[p]
+                    cand = prev[p] if prev[p] > w else w
+                    if cand < best:
+                        best = cand
+                p -= 1
+            cur_row[i] = best
+    limit = f[k][n]
+
+    # 阶段 3：每行 ≤ M 时各行宽平方和的最小值（后缀动态规划，
+    # G[j][i] 表示 text[i:] 排成 j 行的最小平方和）
+    G = [[INF] * (n + 1) for _ in range(k + 1)]
+    G[0][n] = 0
+    for j in range(1, k + 1):
+        prev, cur_row = G[j - 1], G[j]
+        for i in range(n - 1, -1, -1):
+            if not can_start[i]:
+                continue
+            best = INF
+            e = i + 1
+            while e <= n and prefix[e] - prefix[i] <= limit:
+                if can_end[e] and prev[e] != INF:
+                    w = prefix[e] - prefix[i]
+                    cand = w * w + prev[e]
+                    if cand < best:
+                        best = cand
+                e += 1
+            cur_row[i] = best
+    total = G[k][0]
+
+    # 阶段 4：在达到最小平方和的方案中，从左到右逐步取可行的最小断点，
+    # 得到字典序最小的断点序列。不变式：进入每轮时 budget 等于当前后缀
+    # 在剩余行数下的最小平方和，故循环内必然找到可行断点（e ≤ n）。
+    cuts = [0]
+    budget = total
+    for remaining in range(k - 1, -1, -1):
+        cur = cuts[-1]
+        e = cur + 1
+        while True:
+            w = prefix[e] - prefix[cur]
+            if w > limit:
+                break
+            if (
+                can_end[e]
+                and G[remaining][e] != INF
+                and w * w + G[remaining][e] <= budget
+            ):
+                cuts.append(e)
+                budget -= w * w
+                break
+            e += 1
+
+    breaks = cuts[1:-1]
+    lines = [text[cuts[i] : cuts[i + 1]] for i in range(k)]
+    return lines, breaks
+
+
+def layout_wrap(req: WrapRequest) -> tuple[Optional[WrapResponse], List[ErrorItem]]:
+    """逐段做全局最优断行；任一段失败则汇总全部错误返回。"""
+    errors: List[ErrorItem] = []
+    results: List[WrappedSegment] = []
+
+    for idx, seg in enumerate(req.segments):
+        if seg.end <= seg.start:
+            errors.append(
+                ErrorItem(
+                    location="segment",
+                    index=idx,
+                    code="non_positive_duration",
+                    message=(
+                        f"片段时长非正：start={seg.start}，end={seg.end}，要求 end > start"
+                    ),
+                )
+            )
+            continue
+
+        if not seg.text:
+            errors.append(
+                ErrorItem(
+                    location="segment",
+                    index=idx,
+                    code="cannot_wrap",
+                    message=f"第 {idx} 段文字为空，无法排版",
+                )
+            )
+            continue
+
+        wrapped = wrap_text(seg.text, req.max_width, req.max_lines)
+        if wrapped is None:
+            errors.append(
+                ErrorItem(
+                    location="segment",
+                    index=idx,
+                    code="cannot_wrap",
+                    message=(
+                        f"第 {idx} 段无法在 max_width={req.max_width}、"
+                        f"max_lines={req.max_lines} 的约束下完成断行排版"
+                    ),
+                )
+            )
+            continue
+
+        lines, breaks = wrapped
+        results.append(
+            WrappedSegment(
+                index=idx,
+                start=seg.start,
+                end=seg.end,
+                text=seg.text,
+                lines=lines,
+                breaks=breaks,
+            )
+        )
+
+    if errors:
+        return None, errors
+    return WrapResponse(segments=results), []
+
+
+# --------------------------------------------------------------------------- #
 # FastAPI
 # --------------------------------------------------------------------------- #
 app = FastAPI(
@@ -452,9 +689,11 @@ app = FastAPI(
         "全局最优匹配文字相同的片段，返回可直接使用的「原时间 -> 成片时间」"
         "同步锚点；\n"
         "2. ``POST /calibrate``：根据至少两组同步锚点，在相邻锚点间线性换算"
-        "字幕片段的起止时间（毫秒）。"
+        "字幕片段的起止时间（毫秒）；\n"
+        "3. ``POST /layout/wrap``：按显示宽度（全角/宽字符 2 格、其余 1 格）"
+        "为字幕片段做全局最优断行，返回各行文字与断行字符偏移。"
     ),
-    version="1.1.0",
+    version="1.2.0",
 )
 
 
@@ -493,9 +732,27 @@ def calibrate_endpoint(req: CalibrateRequest) -> CalibrateResponse:
     return resp  # type: ignore[return-value]
 
 
+@app.post("/layout/wrap", response_model=WrapResponse)
+def layout_wrap_endpoint(req: WrapRequest) -> WrapResponse:
+    resp, errors = layout_wrap(req)
+    if errors:
+        return JSONResponse(
+            status_code=422,
+            content={
+                "error": "layout_wrap_failed",
+                "detail": [e.model_dump() for e in errors],
+            },
+        )
+    return resp  # type: ignore[return-value]
+
+
 @app.exception_handler(RequestValidationError)
 def _on_validation_error(_: Request, exc: RequestValidationError) -> JSONResponse:
+    # pydantic v2 的错误 ctx 可能携带异常对象，需兜底为字符串才能 JSON 序列化
     return JSONResponse(
         status_code=422,
-        content={"error": "invalid_request", "detail": exc.errors()},
+        content={
+            "error": "invalid_request",
+            "detail": json.loads(json.dumps(exc.errors(), default=str)),
+        },
     )
