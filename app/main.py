@@ -1,4 +1,4 @@
-"""访谈字幕时间轴校准与锚点推荐 API。
+"""访谈字幕时间轴校准、锚点推荐与断行排版 API。
 
 - ``POST /anchors/suggest``：接收原片与成片两条按开始时间严格递增的字幕序列，
   在允许跳过片段的前提下做全局最优的文字精确匹配，返回可直接传给
@@ -6,6 +6,10 @@
 - ``POST /calibrate``：客户端提交以原录音毫秒计时的字幕片段，以及至少两组
   "原时间 -> 成片时间" 同步锚点；服务端在相邻锚点间做线性换算，
   并对超出锚点覆盖范围、换算后时长非正的片段返回错误。
+- ``POST /layout/wrap``：按显示宽度为字幕片段建议断行。宽度按 Unicode 码点
+  计算（东亚全角/宽字符 2 格，其余 1 格），只在字符之间断行并遵守行首/行尾
+  禁则；对每段在所有可行方案中依次按行数最少、最大行宽最小、行宽平方和最小、
+  断点序列字典序最小做全局最优选择（而非逐行贪心）。
 """
 from __future__ import annotations
 
@@ -13,6 +17,7 @@ from array import array
 from bisect import bisect_right
 from fractions import Fraction
 from typing import List, Optional, Tuple
+from unicodedata import east_asian_width
 
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
@@ -90,6 +95,43 @@ class SuggestedAnchor(BaseModel):
 
 class SuggestAnchorsResponse(BaseModel):
     anchors: List[SuggestedAnchor]
+
+
+class WrapSegment(BaseModel):
+    """一条待断行的字幕片段：时码与文字原样保留。"""
+
+    start: int = Field(..., description="片段起始时间（毫秒）")
+    end: int = Field(..., description="片段结束时间（毫秒）")
+    text: str = Field("", description="字幕文字")
+
+
+class WrapRequest(BaseModel):
+    segments: List[WrapSegment] = Field(..., description="待断行的字幕片段")
+    max_width: int = Field(
+        ..., gt=0, description="每行最大显示宽度（格，正整数；全角/宽字符占 2 格）"
+    )
+    max_lines: int = Field(..., ge=1, le=4, description="每段最多行数（1～4）")
+
+
+class WrappedSegment(BaseModel):
+    index: int = Field(..., description="片段在输入中的位置（从 0 开始）")
+    start: int = Field(..., description="原起始时间（毫秒）")
+    end: int = Field(..., description="原结束时间（毫秒）")
+    text: str = Field("", description="原字幕文字")
+    lines: List[str] = Field(
+        ..., description="断行后的各行文字，按顺序拼接即等于原文"
+    )
+    breaks: List[int] = Field(
+        ...,
+        description=(
+            "断行字符偏移（按 Unicode 码点计）：每个偏移是下一行行首字符在原文中的"
+            "下标，即第 i 条断行发生在 text[breaks[i]] 之前"
+        ),
+    )
+
+
+class WrapResponse(BaseModel):
+    segments: List[WrappedSegment]
 
 
 class ErrorItem(BaseModel):
@@ -443,6 +485,172 @@ def suggest_anchors(
 
 
 # --------------------------------------------------------------------------- #
+# 断行（排版）逻辑
+# --------------------------------------------------------------------------- #
+# 行首禁则字符：不允许在某一行开头出现，即不允许在它们前面断行
+NO_LINE_START = frozenset("，。！？；：）】")
+# 行尾禁则字符：不允许在某一行末尾出现，即不允许在它们后面断行
+NO_LINE_END = frozenset("（【")
+
+
+def char_cells(ch: str) -> int:
+    """按 Unicode 码点计宽：东亚全角/宽字符占 2 格，其余占 1 格。"""
+    return 2 if east_asian_width(ch) in ("F", "W") else 1
+
+
+def wrap_text(
+    text: str, max_width: int, max_lines: int
+) -> Optional[Tuple[List[str], List[int]]]:
+    """对单段文字做全局最优断行，返回 (各行文字, 断行字符偏移)；不可行返回 None。
+
+    可行方案须满足：只在字符之间断行；每行非空且宽度不超过 ``max_width``；
+    行首不为 ``NO_LINE_START`` 中的字符、行尾不为 ``NO_LINE_END`` 中的字符；
+    行数不超过 ``max_lines``。在所有可行方案中依次选择：
+
+      1. 行数最少；
+      2. 最大行宽最小；
+      3. 各行宽平方和最小；
+      4. 断点序列字典序最小。
+
+    分三层动态规划求解（而非逐行贪心）：先求最少行数 L，再在恰好 L 行的
+    方案中求最小的最大行宽 W，最后在每行宽不超过 W 的方案中优化
+    (行宽平方和, 断点序列)。由于 max 会把后缀的最大行宽"掩盖"掉，三层目标
+    不能合并成一次 DP，必须逐层把上一层的最优值固化为约束。
+    """
+    n = len(text)
+    if n == 0:
+        return [], []
+
+    # 码点宽度前缀和：text[k:j] 的宽度 = prefix[j] - prefix[k]
+    prefix = [0] * (n + 1)
+    for i, ch in enumerate(text):
+        prefix[i + 1] = prefix[i] + char_cells(ch)
+
+    def breakable(k: int) -> bool:
+        """是否允许在字符偏移 k 处断行（k 为下一行行首字符的下标，1 <= k < n）。"""
+        return text[k] not in NO_LINE_START and text[k - 1] not in NO_LINE_END
+
+    # 第一层：最少行数。min_lines[k] 为 text[k:] 所需的最少行数；
+    # 不可行时保持初始值 n + 1（可行解至多 n 行，每行至少一个字符）
+    min_lines = [n + 1] * (n + 1)
+    min_lines[n] = 0
+    for k in range(n - 1, -1, -1):
+        for j in range(k + 1, n + 1):
+            if prefix[j] - prefix[k] > max_width:
+                break  # 行宽随 j 单调增大，之后的候选只会更宽
+            if j < n and not breakable(j):
+                continue
+            if min_lines[j] + 1 < min_lines[k]:
+                min_lines[k] = min_lines[j] + 1
+    lines_needed = min_lines[0]
+    if lines_needed > n or lines_needed > max_lines:
+        return None
+
+    # 第二层：恰好 lines_needed 行时，最大行宽的最小值。
+    # best_max[k][l] 为 text[k:] 排成 l 行时最大行宽的最小值，-1 表示不可行
+    best_max = [[-1] * (lines_needed + 1) for _ in range(n + 1)]
+    best_max[n][0] = 0
+    for k in range(n - 1, -1, -1):
+        for l in range(1, lines_needed + 1):
+            best = -1
+            for j in range(k + 1, n + 1):
+                w = prefix[j] - prefix[k]
+                if w > max_width:
+                    break
+                if j < n and not breakable(j):
+                    continue
+                sub = best_max[j][l - 1]
+                if sub < 0:
+                    continue
+                cand = w if w > sub else sub
+                if best < 0 or cand < best:
+                    best = cand
+            best_max[k][l] = best
+    width_cap = best_max[0][lines_needed]
+
+    # 第三层：每行宽不超过 width_cap 时，(行宽平方和, 断点序列) 字典序最小。
+    # best_tail[k][l] = (平方和, 断点元组)，None 表示不可行
+    best_tail: List[List[Optional[Tuple[int, Tuple[int, ...]]]]] = [
+        [None] * (lines_needed + 1) for _ in range(n + 1)
+    ]
+    best_tail[n][0] = (0, ())
+    for k in range(n - 1, -1, -1):
+        for l in range(1, lines_needed + 1):
+            best: Optional[Tuple[int, Tuple[int, ...]]] = None
+            for j in range(k + 1, n + 1):
+                w = prefix[j] - prefix[k]
+                if w > width_cap:
+                    break
+                if j < n and not breakable(j):
+                    continue
+                sub = best_tail[j][l - 1]
+                if sub is None:
+                    continue
+                cand = (w * w + sub[0], ((j,) if j < n else ()) + sub[1])
+                if best is None or cand < best:
+                    best = cand
+            best_tail[k][l] = best
+
+    result = best_tail[0][lines_needed]
+    assert result is not None  # 前两层已保证可行
+    breaks = list(result[1])
+    bounds = [0] + breaks + [n]
+    lines = [text[bounds[i]:bounds[i + 1]] for i in range(len(bounds) - 1)]
+    return lines, breaks
+
+
+def layout_wrap(req: WrapRequest) -> tuple[Optional[WrapResponse], List[ErrorItem]]:
+    """对每段字幕做全局最优断行；任一片段失败则收集错误并整体返回 422。"""
+    errors: List[ErrorItem] = []
+    results: List[WrappedSegment] = []
+
+    for idx, seg in enumerate(req.segments):
+        if seg.end <= seg.start:
+            errors.append(
+                ErrorItem(
+                    location="segment",
+                    index=idx,
+                    code="non_positive_duration",
+                    message=(
+                        f"片段时长非正：start={seg.start}，end={seg.end}，要求 end > start"
+                    ),
+                )
+            )
+            continue
+
+        wrapped = wrap_text(seg.text, req.max_width, req.max_lines)
+        if wrapped is None:
+            errors.append(
+                ErrorItem(
+                    location="segment",
+                    index=idx,
+                    code="cannot_wrap",
+                    message=(
+                        f"第 {idx} 段文字无法在 max_width={req.max_width}、"
+                        f"max_lines={req.max_lines} 的约束下完成断行"
+                    ),
+                )
+            )
+            continue
+
+        lines, breaks = wrapped
+        results.append(
+            WrappedSegment(
+                index=idx,
+                start=seg.start,
+                end=seg.end,
+                text=seg.text,
+                lines=lines,
+                breaks=breaks,
+            )
+        )
+
+    if errors:
+        return None, errors
+    return WrapResponse(segments=results), []
+
+
+# --------------------------------------------------------------------------- #
 # FastAPI
 # --------------------------------------------------------------------------- #
 app = FastAPI(
@@ -452,9 +660,11 @@ app = FastAPI(
         "全局最优匹配文字相同的片段，返回可直接使用的「原时间 -> 成片时间」"
         "同步锚点；\n"
         "2. ``POST /calibrate``：根据至少两组同步锚点，在相邻锚点间线性换算"
-        "字幕片段的起止时间（毫秒）。"
+        "字幕片段的起止时间（毫秒）；\n"
+        "3. ``POST /layout/wrap``：按显示宽度为字幕片段建议断行，保留原时码"
+        "与文字，返回每段的各行文字与断行字符偏移。"
     ),
-    version="1.1.0",
+    version="1.2.0",
 )
 
 
@@ -487,6 +697,20 @@ def calibrate_endpoint(req: CalibrateRequest) -> CalibrateResponse:
             status_code=422,
             content={
                 "error": "calibration_failed",
+                "detail": [e.model_dump() for e in errors],
+            },
+        )
+    return resp  # type: ignore[return-value]
+
+
+@app.post("/layout/wrap", response_model=WrapResponse)
+def layout_wrap_endpoint(req: WrapRequest) -> WrapResponse:
+    resp, errors = layout_wrap(req)
+    if errors:
+        return JSONResponse(
+            status_code=422,
+            content={
+                "error": "layout_wrap_failed",
                 "detail": [e.model_dump() for e in errors],
             },
         )

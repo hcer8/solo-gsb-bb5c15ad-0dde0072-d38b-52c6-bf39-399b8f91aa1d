@@ -1,9 +1,10 @@
 # 访谈字幕时间轴校准 API
 
-基于 Python + FastAPI 的字幕时间轴校准服务，提供两个接口：
+基于 Python + FastAPI 的字幕时间轴校准服务，提供三个接口：
 
 1. **`POST /anchors/suggest` 锚点推荐**：提交**原片**与**成片**两条按开始时间严格递增的字幕序列，服务端在允许跳过片段的前提下做**全局最优**的文字精确匹配（重复台词、删段均按全局最优处理，而非逐条贪心），返回可直接用于 `/calibrate` 的同步锚点。
 2. **`POST /calibrate` 时间轴校准**：提交以**原录音毫秒**计时的字幕片段，以及至少两组「原时间 → 成片时间」同步锚点；服务端在相邻锚点之间做**分段线性换算**，输出成片时间轴上的字幕起止时间。
+3. **`POST /layout/wrap` 字幕断行**：提交字幕片段（`start` / `end` / `text`）、每行最大宽度 `max_width` 与最多行数 `max_lines`，服务端按显示宽度为每段建议断行，**保留原时码和文字**，返回每段的各行文字 `lines` 与断行字符偏移 `breaks`。
 
 ## 功能说明
 
@@ -44,6 +45,26 @@
   - 原片段时长非正（`end <= start`）；
   - 换算后/四舍五入后片段时长非正。
 
+### 字幕断行 `/layout/wrap`
+
+- 接收 `segments`（每段含整数毫秒 `start` / `end` 与 `text`）、正整数 `max_width`（每行最大显示宽度，单位：格）与 `max_lines`（每段最多行数，**1～4**）。
+- **宽度按 Unicode 码点计算**：东亚全角/宽字符（`unicodedata.east_asian_width` 为 `F` 或 `W`）占 **2 格**，其余码点占 **1 格**。
+- 断行规则：
+  - 只在**字符之间**断行，不拆分字符；
+  - 每行**非空**且宽度不超过 `max_width`；
+  - **行首禁则**：行首不得为 `，。！？；：）】` 中的字符（即不允许在这些字符前面断行）；
+  - **行尾禁则**：行尾不得为 `（【`（即不允许在这两个字符后面断行）。
+- 对每段，在**所有可行方案**中依次选择（全局最优，**不是逐行贪心**）：
+  1. 行数最少；
+  2. 最大行宽最小；
+  3. 各行宽平方和最小（行宽更均衡）；
+  4. 断点序列字典序最小。
+- 返回每段的 `index`、`start`、`end`、`text`（时码与文字原样保留）、`lines`（各行文字，按顺序拼接即等于原文）与 `breaks`（断行字符偏移，按 Unicode 码点计：第 i 条断行发生在 `text[breaks[i]]` 之前，即 `lines` 依次为 `text[0:breaks[0]]`、`text[breaks[0]:breaks[1]]`、……）。
+- 以下情况返回 `422`，错误体中带出错片段的**下标**（所有片段的错误一次性收集返回）：
+  - 片段时长非正（`end <= start`，`non_positive_duration`）；
+  - 在 `max_width` / `max_lines` 约束下无可行断行方案（`cannot_wrap`，例如单个全角字符宽度即超过 `max_width`）。
+- `max_width` 非正整数、`max_lines` 超出 1～4 等请求体格式错误返回 `422` 且 `error` 为 `invalid_request`。
+
 ## 单条启动命令
 
 无需手动安装依赖，依赖安装与服务启动均已纳入容器启动流程（构建镜像时安装依赖，容器启动时启动服务）：
@@ -82,6 +103,7 @@ docker compose down
 | 健康检查 | `GET http://localhost:8000/health` |
 | 锚点推荐接口 | `POST http://localhost:8000/anchors/suggest` |
 | 校准接口 | `POST http://localhost:8000/calibrate` |
+| 断行接口 | `POST http://localhost:8000/layout/wrap` |
 | 交互式文档（Swagger UI） | `http://localhost:8000/docs` |
 | OpenAPI Schema | `http://localhost:8000/openapi.json` |
 
@@ -216,6 +238,85 @@ docker compose down
 | `non_positive_mapped_duration` | 线性换算后时长非正 |
 | `non_positive_mapped_duration_after_rounding` | 四舍五入到整数毫秒后时长非正（成片轴压缩过度） |
 
+### 请求 `POST /layout/wrap`
+
+```json
+{
+  "segments": [
+    { "start": 0, "end": 2400, "text": "大家好，欢迎来到访谈节目" },
+    { "start": 2400, "end": 5200, "text": "今天聊聊字幕排版。" }
+  ],
+  "max_width": 8,
+  "max_lines": 3
+}
+```
+
+- `segments[].start` / `segments[].end`：片段起止时间，整数毫秒，要求 `end > start`；时码不参与断行计算，原样返回。
+- `segments[].text`：字幕文字，原样保留；断行只发生在字符之间。
+- `max_width`：每行最大显示宽度（格），**正整数**；全角/宽字符占 2 格，其余占 1 格。
+- `max_lines`：每段最多行数，**1～4** 的整数。
+
+### 成功响应 `200`
+
+```json
+{
+  "segments": [
+    {
+      "index": 0,
+      "start": 0,
+      "end": 2400,
+      "text": "大家好，欢迎来到访谈节目",
+      "lines": ["大家好，", "欢迎来到", "访谈节目"],
+      "breaks": [4, 8]
+    },
+    {
+      "index": 1,
+      "start": 2400,
+      "end": 5200,
+      "text": "今天聊聊字幕排版。",
+      "lines": ["今天聊", "聊字幕", "排版。"],
+      "breaks": [3, 6]
+    }
+  ]
+}
+```
+
+- `lines`：断行后的各行文字，按顺序拼接即等于原文；每行非空、不超宽，且满足行首/行尾禁则（如第 1 段在 `，` 后断行，而不是把 `，` 放到下一行行首）。
+- `breaks`：断行字符偏移（按 Unicode 码点计），`breaks[i]` 是第 i+1 行行首字符在原文中的下标；上例第 1 段 `text[0:4]="大家好，"`、`text[4:8]="欢迎来到"`、`text[8:]="访谈节目"`。
+
+### 断行错误响应 `422`
+
+所有片段错误一次性收集返回，`index` 为片段在输入中的位置（从 0 开始）：
+
+```json
+{
+  "error": "layout_wrap_failed",
+  "detail": [
+    {
+      "location": "segment",
+      "index": 1,
+      "code": "non_positive_duration",
+      "message": "片段时长非正：start=500，end=500，要求 end > start"
+    },
+    {
+      "location": "segment",
+      "index": 2,
+      "code": "cannot_wrap",
+      "message": "第 2 段文字无法在 max_width=1、max_lines=2 的约束下完成断行"
+    }
+  ]
+}
+```
+
+错误代码：
+
+| code | 含义 |
+| --- | --- |
+| `non_positive_duration` | 片段 `end <= start`，时长非正 |
+| `cannot_wrap` | 在 `max_width` / `max_lines` 约束下不存在可行断行方案 |
+
+`max_width` 非正整数、`max_lines` 不在 1～4 内、缺字段或类型错误等请求体问题返回 `422` 且 `error` 为 `invalid_request`。
+
 ## 调用示例
 
 ### 第一步：`/anchors/suggest` 自动生成锚点
@@ -295,6 +396,46 @@ curl -s -X POST http://localhost:8000/calibrate \
 }
 ```
 
+### `/layout/wrap` 按显示宽度断行
+
+```bash
+curl -s -X POST http://localhost:8000/layout/wrap \
+  -H "Content-Type: application/json" \
+  -d '{
+    "segments": [
+      {"start": 0, "end": 2400, "text": "大家好，欢迎来到访谈节目"},
+      {"start": 2400, "end": 5200, "text": "今天聊聊字幕排版。"}
+    ],
+    "max_width": 8,
+    "max_lines": 3
+  }'
+```
+
+响应：
+
+```json
+{
+  "segments": [
+    {
+      "index": 0,
+      "start": 0,
+      "end": 2400,
+      "text": "大家好，欢迎来到访谈节目",
+      "lines": ["大家好，", "欢迎来到", "访谈节目"],
+      "breaks": [4, 8]
+    },
+    {
+      "index": 1,
+      "start": 2400,
+      "end": 5200,
+      "text": "今天聊聊字幕排版。",
+      "lines": ["今天聊", "聊字幕", "排版。"],
+      "breaks": [3, 6]
+    }
+  ]
+}
+```
+
 ## 本地开发（不用容器）
 
 ```bash
@@ -308,7 +449,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 .
 ├── app/
 │   ├── __init__.py
-│   └── main.py          # FastAPI 应用、锚点推荐（全局最优匹配）与线性换算逻辑
+│   └── main.py          # FastAPI 应用、锚点推荐（全局最优匹配）、线性换算与断行排版逻辑
 ├── Dockerfile           # 构建期安装依赖，容器启动即启动服务
 ├── docker-compose.yml   # 一键编排
 ├── requirements.txt
